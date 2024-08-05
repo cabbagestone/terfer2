@@ -1,14 +1,17 @@
 use std::fmt::Display;
+use std::sync::{Arc, RwLock};
 use jiff::Zoned;
 use uuid::Uuid;
 
-struct Node<'a> {
+struct Node {
     id: String,
     created_at: Zoned,
     deleted_at: Option<Zoned>,
     instances: Vec<Instance>,
-    edges: Vec<Edge<'a>>
+    edges: Vec<Edge>
 }
+
+type NodeRef = Arc<RwLock<Node>>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum NodeError {
@@ -41,8 +44,8 @@ impl From<EdgeError> for NodeError {
     }
 }
 
-impl<'a> Node<'a> {
-    pub fn new(value: String) -> Node<'a> {
+impl Node {
+    pub fn new(value: String) -> Node {
         Node {
             id: Uuid::new_v4().to_string(),
             created_at: Zoned::now(),
@@ -50,6 +53,10 @@ impl<'a> Node<'a> {
             instances: Vec::from([Instance::new_created(value)]),
             edges: Vec::new()
         }
+    }
+    
+    fn ok_refs_eq(node1: &NodeRef, node2: &NodeRef) -> bool {
+        node1.read().is_ok_and(|n1| node2.read().is_ok_and(|n2| n1.id == n2.id))
     }
     
     fn last_instance(&self) -> Result<&Instance, NodeError> {
@@ -117,59 +124,62 @@ impl<'a> Node<'a> {
         }
     }
     
-    pub fn edges_mut(&mut self) -> impl Iterator<Item = &mut Edge<'a>> {
-        self.edges.iter_mut().filter(|edge| edge.is_live())
+    pub fn edges_mut(&mut self) -> impl Iterator<Item = &mut Edge> {
+        // Poisoned lock is just discarded and not counted
+        self.edges.iter_mut().filter(|edge| edge.is_live().unwrap_or(false))
     }
     
-    pub fn edges(&self) -> impl Iterator<Item = &Edge<'a>> {
-        self.edges.iter().filter(|edge| edge.is_live())
+    pub fn edges(&self) -> impl Iterator<Item = &Edge> {
+        // Poisoned lock is just discarded and not counted
+        self.edges.iter().filter(|edge| edge.is_live().unwrap_or(false))
     }
     
-    pub fn dead_edges_mut(&mut self) -> impl Iterator<Item = &mut Edge<'a>> {
-        self.edges.iter_mut().filter(|edge| edge.is_deleted())
+    pub fn dead_edges_mut(&mut self) -> impl Iterator<Item = &mut Edge> {
+        // Poisoned lock is just discarded and not counted
+        self.edges.iter_mut().filter(|edge| !edge.is_live().unwrap_or(false))
     }
     
-    pub fn connect_to(&mut self, node: &'a Node) -> Result<(), NodeError> {
+    pub fn connect_to(&mut self, node: NodeRef) -> Result<(), NodeError> {
         self.deleted_check()?;
         
-        if Ok(()) == self.restore_connection(&node) {
+        if Ok(()) == self.restore_connection(node.clone()) {
             return Ok(());
         }
         
-        self.edges.push(Edge::new(node));
+        self.edges.push(Edge::new(node.clone()));
         
         Ok(())
     }
     
-    pub fn is_connected_to(&self, node: &Node) -> bool {
-        self.edges().any(|edge| edge.to.id == node.id)
+    pub fn is_connected_to(&self, connection: NodeRef) -> bool {
+        self.edges().any(|edge| Node::ok_refs_eq(&edge.to, &connection))
     }
     
-    pub fn disconnect_from(&mut self, node: &Node) -> Result<(), NodeError> {
+    pub fn disconnect_from(&mut self, node: NodeRef) -> Result<(), NodeError> {
         self.deleted_check()?;
         
-        match self.edges_mut().find(|edge| edge.to.id == node.id) {
+        match self.edges_mut().find(|edge| Node::ok_refs_eq(&edge.to, &node)) {
             Some(edge) => Ok(edge.delete()?),
             None => Err(NodeError::EdgeNotFound)
         }
     }
     
-    pub fn restore_connection(&mut self, node: &Node) -> Result<(), NodeError> {
+    pub fn restore_connection(&mut self, node: NodeRef) -> Result<(), NodeError> {
         self.deleted_check()?;
         
-        match self.dead_edges_mut().find(|edge| edge.to.id == node.id) {
+        match self.dead_edges_mut().find(|edge| Node::ok_refs_eq(&edge.to, &node)) {
             Some(edge) => Ok(edge.restore()?),
             None => Err(NodeError::EdgeNotFound)
         }
     }
     
-    pub fn connection_count(&self) -> usize {
-        self.edges().take_while(|edge| edge.is_live()).count()
+    pub fn connection_count(&self) -> Result<usize, NodeError> {
+        Ok(self.edges().count())
     }
 }
 
-struct Edge<'a> {
-    to: &'a Node<'a>,
+struct Edge {
+    to: NodeRef,
     created_at: Zoned,
     deleted_at: Option<Zoned>
 }
@@ -177,7 +187,8 @@ struct Edge<'a> {
 #[derive(Debug, PartialEq, Eq)]
 enum EdgeError {
     DeleteDeletedEdge,
-    RestoreNotDeletedEdge
+    RestoreNotDeletedEdge,
+    RwLockError(String)
 }
 
 impl std::error::Error for EdgeError {}
@@ -186,13 +197,20 @@ impl Display for EdgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             EdgeError::DeleteDeletedEdge => write!(f, "Cannot delete an already deleted edge"),
-            EdgeError::RestoreNotDeletedEdge => write!(f, "Cannot restore an edge that is not deleted")
+            EdgeError::RestoreNotDeletedEdge => write!(f, "Cannot restore an edge that is not deleted"),
+            EdgeError::RwLockError(message) => write!(f, "Read/Write Lock error: {}", message)
         }
     }
 }
 
-impl<'a> Edge<'a> {
-    fn new(to: &'a Node) -> Edge<'a> {
+impl From<std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Node>>> for EdgeError {
+    fn from(error: std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Node>>) -> EdgeError {
+        EdgeError::RwLockError(error.to_string())
+    }
+}
+
+impl Edge {
+    fn new(to: NodeRef) -> Edge {
         Edge {
             to,
             created_at: Zoned::now(),
@@ -200,8 +218,8 @@ impl<'a> Edge<'a> {
         }
     }
     
-    fn is_live(&self) -> bool {
-        self.deleted_at.is_none() && !self.to.is_deleted()
+    fn is_live(&self) -> Result<bool, EdgeError> {
+        Ok(self.deleted_at.is_none() && !self.to.read()?.is_deleted())
     }
     
     fn is_deleted(&self) -> bool {
@@ -346,5 +364,26 @@ mod tests {
 
         assert_eq!(node1.connection_count(), 0);
         assert_eq!(node1.is_connected_to(&node2), false);
+    }
+    
+    #[test]
+    fn test_everything() {
+        let mut node1 = Node::new("value1".to_string());
+        let mut node2 = Node::new("value2".to_string());
+        
+        node1.connect_to(&node2).unwrap();
+        node1.update("new value1".to_string()).unwrap();
+        node2.update("new value2".to_string()).unwrap();
+        node1.delete().unwrap();
+        node2.delete().unwrap();
+        node1.restore().unwrap();
+        node2.restore().unwrap();
+        node1.disconnect_from(&node2).unwrap();
+        
+        assert_eq!(node1.instances.len(), 6);
+        assert_eq!(node1.edges.len(), 0);
+        assert_eq!(node1.is_deleted(), false);
+        assert_eq!(node1.value().unwrap(), "new value1");
+        assert_eq!(node1.connection_count(), 0);
     }
 }
