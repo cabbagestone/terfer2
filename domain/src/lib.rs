@@ -1,5 +1,5 @@
 use std::fmt::Display;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use jiff::Zoned;
 use uuid::Uuid;
 
@@ -8,10 +8,12 @@ struct Node {
     created_at: Zoned,
     deleted_at: Option<Zoned>,
     instances: Vec<Instance>,
-    edges: Vec<Edge>
+    edges: Vec<EdgeRef>,
 }
 
 type NodeRef = Arc<RwLock<Node>>;
+type WeakNodeRef = Weak<RwLock<Node>>;
+type EdgeRef = Arc<RwLock<Edge>>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum NodeError {
@@ -20,6 +22,7 @@ enum NodeError {
     OperationOnDeletedNode,
     RestoreNotDeletedNode,
     EdgeNotFound,
+    RwLockError(String),
     Edge(EdgeError)
 }
 
@@ -33,7 +36,8 @@ impl Display for NodeError {
             NodeError::DeleteDeletedNode => write!(f, "Cannot delete an already deleted node"),
             NodeError::RestoreNotDeletedNode => write!(f, "Cannot restore a node that is not deleted"),
             NodeError::EdgeNotFound => write!(f, "No related node found"),
-            NodeError::Edge(error) => write!(f, "Edge error: {}", error)
+            NodeError::Edge(error) => write!(f, "Edge error: {}", error),
+            NodeError::RwLockError(message) => write!(f, "Read/Write lock error: {}", message)
         }
     }
 }
@@ -41,6 +45,30 @@ impl Display for NodeError {
 impl From<EdgeError> for NodeError {
     fn from(error: EdgeError) -> NodeError {
         NodeError::Edge(error)
+    }
+}
+
+impl From<std::sync::PoisonError<std::sync::RwLockWriteGuard<'_, Node>>> for NodeError {
+    fn from(error: std::sync::PoisonError<std::sync::RwLockWriteGuard<'_, Node>>) -> NodeError {
+        NodeError::RwLockError(error.to_string())
+    }
+}
+
+impl From<std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Node>>> for NodeError {
+    fn from(error: std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Node>>) -> NodeError {
+        NodeError::RwLockError(error.to_string())
+    }
+}
+
+impl From<std::sync::PoisonError<std::sync::RwLockWriteGuard<'_, Edge>>> for NodeError {
+    fn from(error: std::sync::PoisonError<std::sync::RwLockWriteGuard<'_, Edge>>) -> NodeError {
+        NodeError::RwLockError(error.to_string())
+    }
+}
+
+impl From<std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Edge>>> for NodeError {
+    fn from(error: std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Edge>>) -> NodeError {
+        NodeError::RwLockError(error.to_string())
     }
 }
 
@@ -55,8 +83,8 @@ impl Node {
         }
     }
     
-    fn ok_refs_eq(node1: &NodeRef, node2: &NodeRef) -> bool {
-        node1.read().is_ok_and(|n1| node2.read().is_ok_and(|n2| n1.id == n2.id))
+    fn panic_on_poison_eq(node1: NodeRef, node2: NodeRef) -> bool {
+        node1.read().unwrap().id == node2.read().unwrap().id
     }
     
     fn last_instance(&self) -> Result<&Instance, NodeError> {
@@ -124,62 +152,70 @@ impl Node {
         }
     }
     
-    pub fn edges_mut(&mut self) -> impl Iterator<Item = &mut Edge> {
-        // Poisoned lock is just discarded and not counted
-        self.edges.iter_mut().filter(|edge| edge.is_live().unwrap_or(false))
+    pub fn edges_mut(&mut self) -> impl Iterator<Item = &mut EdgeRef> {
+        self.edges.iter_mut().filter(|edge| edge.is_live())
     }
     
-    pub fn edges(&self) -> impl Iterator<Item = &Edge> {
-        // Poisoned lock is just discarded and not counted
-        self.edges.iter().filter(|edge| edge.is_live().unwrap_or(false))
+    pub fn edges(&self) -> impl Iterator<Item = &EdgeRef> {
+        self.edges.iter().filter(|edge| edge.is_live())
     }
     
-    pub fn dead_edges_mut(&mut self) -> impl Iterator<Item = &mut Edge> {
-        // Poisoned lock is just discarded and not counted
-        self.edges.iter_mut().filter(|edge| !edge.is_live().unwrap_or(false))
+    pub fn dead_edges_mut(&mut self) -> impl Iterator<Item = &mut EdgeRef> {
+        self.edges.iter_mut().filter(|edge| !edge.is_live())
     }
     
-    pub fn connect_to(&mut self, node: NodeRef) -> Result<(), NodeError> {
-        self.deleted_check()?;
+    pub fn make_parent_of(ref_to_parent: NodeRef, ref_to_child: NodeRef) -> Result<(), NodeError> {
+        let mut parent = ref_to_parent.write()?;
+        parent.deleted_check()?;
         
-        if Ok(()) == self.restore_connection(node.clone()) {
-            return Ok(());
-        }
+        let mut child = ref_to_child.write()?;
+        child.deleted_check()?;
         
-        self.edges.push(Edge::new(node.clone()));
+        let edge = Edge::new_ref(ref_to_parent.clone(), ref_to_child.clone());
+        parent.add_or_restore_edge(edge.clone())?;
+        child.add_or_restore_edge(edge.clone())?;
         
         Ok(())
     }
     
-    pub fn is_connected_to(&self, connection: NodeRef) -> bool {
-        self.edges().any(|edge| Node::ok_refs_eq(&edge.to, &connection))
-    }
-    
-    pub fn disconnect_from(&mut self, node: NodeRef) -> Result<(), NodeError> {
-        self.deleted_check()?;
-        
-        match self.edges_mut().find(|edge| Node::ok_refs_eq(&edge.to, &node)) {
-            Some(edge) => Ok(edge.delete()?),
-            None => Err(NodeError::EdgeNotFound)
+    fn add_or_restore_edge(&mut self, edge: EdgeRef) -> Result<(), NodeError> {
+        let value: Option<&mut EdgeRef>;
+        {
+            value = self.dead_edges_mut().find(|e| Edge::panic_on_poison_eq(e, &edge));
         }
-    }
-    
-    pub fn restore_connection(&mut self, node: NodeRef) -> Result<(), NodeError> {
-        self.deleted_check()?;
         
-        match self.dead_edges_mut().find(|edge| Node::ok_refs_eq(&edge.to, &node)) {
+        match value {
             Some(edge) => Ok(edge.restore()?),
+            None => {
+                self.edges.push(edge);
+                Ok(())
+            }
+        }
+    }
+    
+    pub fn is_parent_of(&self, connection: NodeRef) -> bool {
+        self.edges().any(
+            |edge| Node::panic_on_poison_eq(edge.read_child(), connection.clone()))
+    }
+    
+    pub fn remove_child(&mut self, node: NodeRef) -> Result<(), NodeError> {
+        self.deleted_check()?;
+        
+        match self.edges_mut().find(|edge| Node::panic_on_poison_eq(edge.read_child(), node.clone())) {
+            Some(edge) => Ok(edge.write()?.delete()?),
             None => Err(NodeError::EdgeNotFound)
         }
     }
     
-    pub fn connection_count(&self) -> Result<usize, NodeError> {
+    pub fn edge_count(&self) -> Result<usize, NodeError> {
         Ok(self.edges().count())
     }
 }
 
 struct Edge {
-    to: NodeRef,
+    id: String,
+    parent: WeakNodeRef, 
+    child: NodeRef,
     created_at: Zoned,
     deleted_at: Option<Zoned>
 }
@@ -188,7 +224,8 @@ struct Edge {
 enum EdgeError {
     DeleteDeletedEdge,
     RestoreNotDeletedEdge,
-    RwLockError(String)
+    RwLockError(String),
+    WeakReferenceUpgradeFailed
 }
 
 impl std::error::Error for EdgeError {}
@@ -198,7 +235,8 @@ impl Display for EdgeError {
         match self {
             EdgeError::DeleteDeletedEdge => write!(f, "Cannot delete an already deleted edge"),
             EdgeError::RestoreNotDeletedEdge => write!(f, "Cannot restore an edge that is not deleted"),
-            EdgeError::RwLockError(message) => write!(f, "Read/Write Lock error: {}", message)
+            EdgeError::RwLockError(message) => write!(f, "Read/Write Lock error: {}", message),
+            EdgeError::WeakReferenceUpgradeFailed => write!(f, "Failed to upgrade weak reference")
         }
     }
 }
@@ -209,17 +247,77 @@ impl From<std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Node>>> for Edge
     }
 }
 
+impl From<std::sync::PoisonError<std::sync::RwLockWriteGuard<'_, Node>>> for EdgeError {
+    fn from(error: std::sync::PoisonError<std::sync::RwLockWriteGuard<'_, Node>>) -> EdgeError {
+        EdgeError::RwLockError(error.to_string())
+    }
+}
+
+impl From<std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Edge>>> for EdgeError {
+    fn from(error: std::sync::PoisonError<std::sync::RwLockReadGuard<'_, Edge>>) -> EdgeError {
+        EdgeError::RwLockError(error.to_string())
+    }
+}
+
+impl From<std::sync::PoisonError<std::sync::RwLockWriteGuard<'_, Edge>>> for EdgeError {
+    fn from(error: std::sync::PoisonError<std::sync::RwLockWriteGuard<'_, Edge>>) -> EdgeError {
+        EdgeError::RwLockError(error.to_string())
+    }
+}
+
+trait EdgeApi {
+    fn read_child(&self) -> NodeRef;
+    fn read_parent(&self) -> NodeRef;
+    fn is_live(&self) -> bool;
+    fn delete(&mut self) -> Result<(), EdgeError>;
+    fn restore(&mut self) -> Result<(), EdgeError>;
+}
+
+impl EdgeApi for Arc<RwLock<Edge>> {
+    fn read_child(&self) -> NodeRef {
+        self.read().unwrap().child.clone()
+    }
+    
+    fn read_parent(&self) -> NodeRef {
+        self.read().unwrap().parent.upgrade().unwrap().clone()
+    }
+    
+    fn is_live(&self) -> bool {
+        self.read().unwrap().is_live()
+    }
+    
+    fn delete(&mut self) -> Result<(), EdgeError> {
+        self.write()?.delete()
+    }
+    
+    fn restore(&mut self) -> Result<(), EdgeError> {
+        self.write()?.restore()
+    }
+}
+
 impl Edge {
-    fn new(to: NodeRef) -> Edge {
+    fn new_ref(from: NodeRef, to: NodeRef) -> EdgeRef {
+        Arc::new(RwLock::new(Edge::new(Arc::downgrade(&from.clone()), to.clone())))
+    }
+    
+    fn new(parent: WeakNodeRef, child: NodeRef) -> Edge {
         Edge {
-            to,
+            id: Uuid::new_v4().to_string(),
+            parent,
+            child,
             created_at: Zoned::now(),
             deleted_at: None
         }
     }
+
+    fn panic_on_poison_eq(edge1: &EdgeRef, edge2: &EdgeRef) -> bool {
+        edge1.read().unwrap().id == edge2.read().unwrap().id
+    }
     
-    fn is_live(&self) -> Result<bool, EdgeError> {
-        Ok(self.deleted_at.is_none() && !self.to.read()?.is_deleted())
+    fn is_live(&self) -> bool {
+        self.deleted_at.is_none() &&
+        !self.child.read().unwrap().is_deleted() &&
+        self.parent.upgrade().is_some_and(|p| !p.read().unwrap().is_deleted())
     }
     
     fn is_deleted(&self) -> bool {
@@ -348,10 +446,10 @@ mod tests {
         let mut node1 = Node::new("value1".to_string());
         let node2 = Node::new("value2".to_string());
 
-        node1.connect_to(&node2).unwrap();
+        node1.make_parent_of(&node2).unwrap();
 
         assert_eq!(node1.edges.len(), 1);
-        assert_eq!(node1.is_connected_to(&node2), true);
+        assert_eq!(node1.is_parent_of(&node2), true);
     }
 
     #[test]
@@ -359,11 +457,11 @@ mod tests {
         let mut node1 = Node::new("value1".to_string());
         let node2 = Node::new("value2".to_string());
 
-        node1.connect_to(&node2);
-        node1.disconnect_from(&node2).unwrap();
+        node1.make_parent_of(&node2);
+        node1.remove_child(&node2).unwrap();
 
-        assert_eq!(node1.connection_count(), 0);
-        assert_eq!(node1.is_connected_to(&node2), false);
+        assert_eq!(node1.edge_count(), 0);
+        assert_eq!(node1.is_parent_of(&node2), false);
     }
     
     #[test]
@@ -371,19 +469,19 @@ mod tests {
         let mut node1 = Node::new("value1".to_string());
         let mut node2 = Node::new("value2".to_string());
         
-        node1.connect_to(&node2).unwrap();
+        node1.make_parent_of(&node2).unwrap();
         node1.update("new value1".to_string()).unwrap();
         node2.update("new value2".to_string()).unwrap();
         node1.delete().unwrap();
         node2.delete().unwrap();
         node1.restore().unwrap();
         node2.restore().unwrap();
-        node1.disconnect_from(&node2).unwrap();
+        node1.remove_child(&node2).unwrap();
         
         assert_eq!(node1.instances.len(), 6);
         assert_eq!(node1.edges.len(), 0);
         assert_eq!(node1.is_deleted(), false);
         assert_eq!(node1.value().unwrap(), "new value1");
-        assert_eq!(node1.connection_count(), 0);
+        assert_eq!(node1.edge_count(), 0);
     }
 }
