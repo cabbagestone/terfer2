@@ -4,7 +4,7 @@ create table if not exists node (
     id text primary key not null,
     
     created_at text not null,
-    deleted_at text,
+    deleted_at text
 );
 
 create table if not exists edge (
