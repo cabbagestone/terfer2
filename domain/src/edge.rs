@@ -1,26 +1,30 @@
-use std::sync::{Arc, RwLock};
+use crate::node::NodeApi;
+
+use super::node::{NodeReadPoisonError, NodeRef, NodeWritePoisonError, WeakNodeRef};
 use jiff::Zoned;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
-use super::node::{NodeRef, WeakNodeRef, NodeWritePoisonError, NodeReadPoisonError};
 
 pub(crate) type EdgeRef = Arc<RwLock<Edge>>;
-pub(crate) type EdgeWritePoisonError<'a> = std::sync::PoisonError<std::sync::RwLockWriteGuard<'a, Edge>>;
-pub(crate) type EdgeReadPoisonError<'a> = std::sync::PoisonError<std::sync::RwLockReadGuard<'a, Edge>>;
+pub(crate) type EdgeWritePoisonError<'a> =
+    std::sync::PoisonError<std::sync::RwLockWriteGuard<'a, Edge>>;
+pub(crate) type EdgeReadPoisonError<'a> =
+    std::sync::PoisonError<std::sync::RwLockReadGuard<'a, Edge>>;
 
-pub(crate) struct Edge {
+pub struct Edge {
     id: String,
     parent: WeakNodeRef,
     child: NodeRef,
     created_at: Zoned,
-    deleted_at: Option<Zoned>
+    deleted_at: Option<Zoned>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum EdgeError {
+pub enum EdgeError {
     DeleteDeletedEdge,
     RestoreNotDeletedEdge,
     RwLockError(String),
-    WeakReferenceUpgradeFailed
+    WeakReferenceUpgradeFailed,
 }
 
 impl std::error::Error for EdgeError {}
@@ -29,9 +33,11 @@ impl std::fmt::Display for EdgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             EdgeError::DeleteDeletedEdge => write!(f, "Cannot delete an already deleted edge"),
-            EdgeError::RestoreNotDeletedEdge => write!(f, "Cannot restore an edge that is not deleted"),
+            EdgeError::RestoreNotDeletedEdge => {
+                write!(f, "Cannot restore an edge that is not deleted")
+            }
             EdgeError::RwLockError(message) => write!(f, "Read/Write Lock error: {}", message),
-            EdgeError::WeakReferenceUpgradeFailed => write!(f, "Failed to upgrade weak reference")
+            EdgeError::WeakReferenceUpgradeFailed => write!(f, "Failed to upgrade weak reference"),
         }
     }
 }
@@ -92,7 +98,10 @@ impl EdgeApi for Arc<RwLock<Edge>> {
 
 impl Edge {
     pub(crate) fn new_ref(from: NodeRef, to: NodeRef) -> EdgeRef {
-        Arc::new(RwLock::new(Edge::new(Arc::downgrade(&from.clone()), to.clone())))
+        Arc::new(RwLock::new(Edge::new(
+            Arc::downgrade(&from.clone()),
+            to.clone(),
+        )))
     }
 
     fn new(parent: WeakNodeRef, child: NodeRef) -> Edge {
@@ -101,7 +110,7 @@ impl Edge {
             parent,
             child,
             created_at: Zoned::now(),
-            deleted_at: None
+            deleted_at: None,
         }
     }
 
@@ -110,9 +119,9 @@ impl Edge {
     }
 
     fn is_live(&self) -> bool {
-        self.deleted_at.is_none() &&
-            !self.child.read().unwrap().is_deleted() &&
-            self.parent.upgrade().is_some_and(|p| !p.read().unwrap().is_deleted())
+        self.deleted_at.is_none()
+            && !self.child.is_deleted()
+            && self.parent.upgrade().is_some_and(|p| !p.is_deleted())
     }
 
     fn is_deleted(&self) -> bool {
