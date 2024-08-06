@@ -155,19 +155,19 @@ impl Node {
         }
     }
 
-    pub fn edges_mut(&mut self) -> impl Iterator<Item = &mut EdgeRef> {
+    fn edges_mut(&mut self) -> impl Iterator<Item = &mut EdgeRef> {
         self.edges.iter_mut().filter(|edge| edge.is_live())
     }
 
-    pub fn edges(&self) -> impl Iterator<Item = &EdgeRef> {
+    fn edges(&self) -> impl Iterator<Item = &EdgeRef> {
         self.edges.iter().filter(|edge| edge.is_live())
     }
 
-    pub fn dead_edges_mut(&mut self) -> impl Iterator<Item = &mut EdgeRef> {
+    fn dead_edges_mut(&mut self) -> impl Iterator<Item = &mut EdgeRef> {
         self.edges.iter_mut().filter(|edge| !edge.is_live())
     }
 
-    pub fn make_parent_of(ref_to_parent: NodeRef, ref_to_child: NodeRef) -> Result<(), NodeError> {
+    fn make_parent_of(ref_to_parent: NodeRef, ref_to_child: NodeRef) -> Result<(), NodeError> {
         let mut parent = ref_to_parent.write()?;
         parent.deleted_check()?;
 
