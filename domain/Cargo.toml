@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 jiff = "0.1.4"
+petgraph = "0.6.5"
 uuid = { version = "1.10.0", features = ["v4"] }
