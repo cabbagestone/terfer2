@@ -158,7 +158,7 @@ impl Node {
 
     fn value(&self) -> Result<&str, NodeError> {
         match self.last_instance() {
-            Ok(instance) => Ok(&instance.value()),
+            Ok(instance) => Ok(instance.value()),
             Err(_) => Err(NodeError::OperationOnEmptyNode),
         }
     }
@@ -257,15 +257,19 @@ impl NodeApi for NodeRef {
         ref_to_child: NodeRef,
     ) -> Result<(), NodeError> {
         // TODO: Cannot be parent of self
-        let mut parent = ref_to_parent.write()?;
-        parent.deleted_check()?;
+        let edge: EdgeRef;
+        {
+            ref_to_child.read()?.deleted_check()?;
+            ref_to_parent.read()?.deleted_check()?;
+            edge = Edge::new_ref(ref_to_parent.clone(), ref_to_child.clone());
+        }
 
-        let mut child = ref_to_child.write()?;
-        child.deleted_check()?;
-
-        let edge = Edge::new_ref(ref_to_parent.clone(), ref_to_child.clone());
-        parent.add_or_restore_edge(edge.clone())?;
-        child.add_or_restore_edge(edge.clone())?;
+        {
+            ref_to_parent.write()?.add_or_restore_edge(edge.clone())?;
+        }
+        {
+            ref_to_child.write()?.add_or_restore_edge(edge.clone())?;
+        }
 
         Ok(())
     }
